@@ -14,10 +14,12 @@ class Pool {
 public:
 	Pool() {
 		int hardConcurrency = std::thread::hardware_concurrency();
-		int softConcurrency = hardConcurrency * 64;
+		int softConcurrency = hardConcurrency * 8;
 		for (int i = 0; i < softConcurrency; ++i) {
 			pool.push_back(std::thread(loop));
 		}
+	}
+	~Pool() {
 	}
 
 	static void loop() {
@@ -26,7 +28,7 @@ public:
 			std::function<void()> func = NULL;
 			{
 				std::unique_lock<std::mutex> lock(mutex);
-				cond.wait(lock, [] {return !queue.empty(); });
+				cond.wait(lock, [] {return (!queue.empty()); });
 				func = queue.front();
 				queue.pop();
 			}
@@ -107,6 +109,9 @@ public:
 			}
 		}
 	}
+	int getFd() {
+		return this->fd;
+	}
 	char* getMethod() {
 		return this->method;
 	}
@@ -131,7 +136,7 @@ private:
 	char* path;
 	int contentLength;
 	char remoteAddr[18];
-	
+
 	int fd = -1;
 
 	ssize_t readh(int fd, char* ptr) {
@@ -182,62 +187,100 @@ public:
 	Response(int sock) {
 		this->fd = sock;
 	}
-	Response(int sock, int code) {
-		this->fd = sock;
-		if (code == 200) {
-			writen(fd, RESPONSE_200, strlen(RESPONSE_200));
-		}
-		else if (code == 404) {
-			writen(fd, RESPONSE_404, strlen(RESPONSE_404));
-		}
-		else {
-			writen(fd, RESPONSE_200, strlen(RESPONSE_200)); // return 200 defalut
-		}
-		mClose();
-		hasFlushed = true;
+	Response(Request& request) {
+		this->fd = request.getFd();
+		if (this->fd == -1) this->isClosed = true;
 	}
 	~Response() {
-		if (hasFlushed) return;
-		mClose();
+		finalize();
 	}
 
+	void clear() {
+		if (isClosed) return;
+		b.clear();
+	}
 	void append(std::string s) {
-		if (hasFlushed) return;
-		ss << s;
+		if (isClosed) return;
+		b << s;
 	}
 	void append(char* s) {
-		if (hasFlushed) return;
-		ss << s;
+		if (isClosed) return;
+		b << s;
 	}
-	void flush() {
-		if (hasFlushed) return;
+	void setStatusCode(int c) {
+		this->statusCode = c;
+	}
+	void setContentType(char* contentType) {
+		this->contentType = contentType;
+	}
 
-		const char* HEADER_L1 = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n";
-		const char* HEADER_L2 = "Content-Length: ";
-		const char* HEADER_L3 = "\r\n\r\n";
-		long unsigned int content_length = ss.str().length();
-		std::string body_len = std::to_string(content_length);
 
+protected:
+	void generateHeader(int contentLength) {
+		if (statusCode == 200) {
+			h << RESPONSE_200 << ENDL;
+		}
+		else if (statusCode == 400) {
+			h << RESPONSE_400 << ENDL;
+		}
+		else if (statusCode == 404) {
+			h << RESPONSE_404 << ENDL;
+		}
+		else if (statusCode == 405) {
+			h << RESPONSE_405 << ENDL;
+		}
+		else {
+			h << RESPONSE_500 << ENDL;
+		}
+		h << "Server: " << serverName << ENDL
+			<< "Content-Type: " << contentType << ENDL
+			<< "Content-Length: " << contentLength << ENDL << ENDL;
+	}
+	void finalize() {
+		if (isClosed) return;
+
+		// finalize body
+		std::string temp = b.str();
+		char* body = (char*)temp.c_str();
+		int contentLength = strlen(body);
+
+		// finalize header
+		generateHeader(contentLength);
+		std::string temp2 = h.str();
+		char* header = (char*)temp2.c_str();
+
+
+		std::cout
+			<< "[" << header << body << "]\n";
+
+		// write on socket
 		ssize_t n = 0;
-		n += writen(fd, HEADER_L1, strlen(HEADER_L1));
-		n += writen(fd, HEADER_L2, strlen(HEADER_L2));
-		n += writen(fd, body_len.c_str(), strlen(body_len.c_str()));
-		n += writen(fd, HEADER_L3, strlen(HEADER_L3));
-		n += writen(fd, ss.str().c_str(), content_length);
-		mClose();
-		hasFlushed = true;
-	}
-private:
-	int fd = -1;
-	const char* RESPONSE_200 = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
-	const char* RESPONSE_404 = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 19\r\n\r\nResource not found.";
-	std::stringstream ss;
-	bool hasFlushed = false;
+		n += writen(fd, header, strlen(header));
+		n += writen(fd, body, strlen(body));
 
-	void mClose() {
 		shutdown(fd, SHUT_RDWR);
 		close(fd);
+		isClosed = true;
 	}
+
+private:
+	int fd = -1;
+	const char* ENDL = "\r\n";
+	const char* RESPONSE_200 = "HTTP/1.1 200 OK";
+	const char* RESPONSE_400 = "HTTP/1.1 400 Bad Request";
+	const char* RESPONSE_404 = "HTTP/1.1 404 Not Found";
+	const char* RESPONSE_405 = "HTTP/1.1 405 Method Not Allowed";
+	const char* RESPONSE_500 = "HTTP/1.1 500 Internal Server Error";
+	std::stringstream h;
+	std::stringstream b;
+	bool isClosed = false;
+
+	int   statusCode = 200;
+	const char* contentType = "text/plain"; // default
+	const char* serverName = "SIMPLE-HTTP";
+	//int   statusCode = 0;
+	//char* contentType = NULL;
+
 	ssize_t writen(int fd, const char* ptr, size_t n) {
 		size_t  n_left;
 		ssize_t n_written;
@@ -259,11 +302,13 @@ private:
 
 class Base {
 public:
-	Base() { ; }
-	~Base() { ; }
+	Base() { pool = new Pool; }
+	~Base() {
+		delete pool;
+	}
 
 	void run() {
-		int r_sock_fd, l_sockfd;
+		int l_sock_fd, r_sock_fd;
 		struct sockaddr_in serv_addr, cli_addr;
 		socklen_t clilen;
 
@@ -274,45 +319,72 @@ public:
 		serv_addr.sin_port = htons(this->port);
 		clilen = sizeof(cli_addr);
 
-		if ((l_sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		l_sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (l_sock_fd < 0) {
+			std::cerr << "socket error" << std::endl;
 			return;
-		if (bind(l_sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+		}
+		if (bind(l_sock_fd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
 			std::cerr << "bind error" << std::endl;
 			return;
 		}
 
-		listen(l_sockfd, 5);
+		listen(l_sock_fd, 5);
+		std::cout << "server socket initialized." << std::endl;
 
 		do {
-			r_sock_fd = accept(l_sockfd, (struct sockaddr *) &cli_addr, &clilen);
+			r_sock_fd = accept(l_sock_fd, (struct sockaddr *) &cli_addr, &clilen);
 			if (r_sock_fd < 0) {
-				//errno = 0; // ignore
+				errno = 0; // ignore
 			}
 			else {
-				pool.insert(std::bind(&Base::handler, this, r_sock_fd, cli_addr));
+				pool->insert(std::bind(&Base::handler, this, r_sock_fd, cli_addr));
 			}
 		} while (1);
 	}
 
 	void handler(int r_sock, sockaddr_in cli_addr) {
-
-	
+		std::cout << "client handler start." << std::endl;
 		Request request(r_sock, &cli_addr);
-		if (request.isReady()) {
-			Response response(r_sock, 200);
-			
-			std::cout << request.getBody() << std::endl;
-			
-			//int64_t t = std::chrono::system_clock::now().time_since_epoch().count();
-			//int c = sched_getcpu();
-			//std::cout << r_sock << "\t" << std::endl;
-		}
+		Response response(request);
 
+		if (!request.isReady()) { return; }
+
+		char* path = request.getPath();
+		char* method = request.getMethod();
+
+		if (!strcmp(path, "/")) {
+			if (!strcmp(method, "GET")) {
+				response.setStatusCode(200);
+				response.append("Hello, world!");
+			}
+			else {
+				response.setStatusCode(405);
+			}
+		}
+		else if (!strcmp(path, "/foo")) {
+			if (!strcmp(method, "GET")) {
+				response.setStatusCode(200);
+				response.append("You have reached foo resource.");
+			}
+			else if (!strcmp(method, "POST")) {
+				response.setStatusCode(500);
+			}
+			else {
+				response.setStatusCode(405);
+			}
+		}
+		else if (!strcmp(path, "/bar")) {
+			response.setStatusCode(200);
+			response.append("You have reached bar resource.");
+		}
+		else {
+			response.setStatusCode(404);
+			response.append("Nothing is here.");
+		}
 	}
 
 private:
-	Pool pool;
+	Pool* pool;
 	int port = 8080;
 };
-
-
