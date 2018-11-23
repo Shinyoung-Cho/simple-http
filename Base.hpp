@@ -7,9 +7,9 @@
 #include <vector>
 #include <queue>
 #include <functional>
+#include <chrono>
 
 //#include <sched.h>
-
 class Pool {
 public:
 	Pool() {
@@ -50,12 +50,7 @@ private:
 	static std::mutex mutex;
 	static std::condition_variable cond;
 };
-std::vector<std::thread> Pool::pool;
-std::queue<std::function<void()>> Pool::queue;
-std::mutex Pool::mutex;
-std::condition_variable Pool::cond;
 ////////////////////////////////////////////////////////////////////////////////
-
 
 
 // c headers
@@ -63,6 +58,7 @@ std::condition_variable Pool::cond;
 #include <netinet/in.h>
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
 
 // cpp headers
 #include <sstream>
@@ -78,10 +74,9 @@ public:
 		this->fd = sock;
 
 		//inet_ntoa()
-		unsigned char *bytes = (unsigned char *)&remote;
+		unsigned char *bytes = (unsigned char *)&remote->sin_addr;
 		snprintf(remoteAddr, 18, "%d.%d.%d.%d",
 			bytes[0], bytes[1], bytes[2], bytes[3]);
-
 
 		//read from a socket
 		if (readh(fd, header_buffer) == -1) {
@@ -135,7 +130,7 @@ private:
 	char* method;
 	char* path;
 	int contentLength;
-	char remoteAddr[18];
+	char remoteAddr[18] = {0};
 
 	int fd = -1;
 
@@ -213,6 +208,8 @@ public:
 	void setContentType(char* contentType) {
 		this->contentType = contentType;
 	}
+	int getStatusCode() { return this->statusCode; }
+	int getContentLength() { return b.str().size(); }
 
 
 protected:
@@ -242,16 +239,14 @@ protected:
 		// finalize body
 		std::string temp = b.str();
 		char* body = (char*)temp.c_str();
-		int contentLength = strlen(body);
+		this->contentLength = strlen(body);
 
 		// finalize header
 		generateHeader(contentLength);
 		std::string temp2 = h.str();
 		char* header = (char*)temp2.c_str();
 
-
-		std::cout
-			<< "[" << header << body << "]\n";
+		//std::cout << "[" << header << body << "]\n";
 
 		// write on socket
 		ssize_t n = 0;
@@ -275,6 +270,7 @@ private:
 	std::stringstream b;
 	bool isClosed = false;
 
+	int contentLength = -1;
 	int   statusCode = 200;
 	const char* contentType = "text/plain"; // default
 	const char* serverName = "SIMPLE-HTTP";
@@ -300,14 +296,20 @@ private:
 
 
 
-class Base {
+class ServerBase {
 public:
-	Base() { pool = new Pool; }
-	~Base() {
+	ServerBase() {
+		pool = new Pool;
+	}
+	ServerBase(int port) {
+		pool = new Pool;
+		this->port = port;
+	}
+	~ServerBase() {
 		delete pool;
 	}
 
-	void run() {
+	void start() {
 		int l_sock_fd, r_sock_fd;
 		struct sockaddr_in serv_addr, cli_addr;
 		socklen_t clilen;
@@ -329,7 +331,7 @@ public:
 			return;
 		}
 
-		listen(l_sock_fd, 5);
+		listen(l_sock_fd, 1024);
 		std::cout << "server socket initialized." << std::endl;
 
 		do {
@@ -338,53 +340,80 @@ public:
 				errno = 0; // ignore
 			}
 			else {
-				pool->insert(std::bind(&Base::handler, this, r_sock_fd, cli_addr));
+				pool->insert(std::bind(&ServerBase::c_handler, this, r_sock_fd, cli_addr));
 			}
 		} while (1);
 	}
 
-	void handler(int r_sock, sockaddr_in cli_addr) {
-		std::cout << "client handler start." << std::endl;
+protected:
+	virtual void m_handler(Request* request, Response* response){
+		char* path = request->getPath();
+		char* method = request->getMethod();
+
+		if (!strcmp(path, "/")) {
+			if (!strcmp(method, "GET")) {
+				response->setStatusCode(200);
+				response->append("Hello, world!");
+			}
+			else {
+				response->setStatusCode(405);
+			}
+		}
+		else if (!strcmp(path, "/foo")) {
+			if (!strcmp(method, "GET")) {
+				response->setStatusCode(200);
+				response->append("You have reached foo resource.");
+			}
+			else if (!strcmp(method, "POST")) {
+				response->setStatusCode(500);
+			}
+			else {
+				response->setStatusCode(405);
+			}
+		}
+		else if (!strcmp(path, "/bar")) {
+			response->setStatusCode(200);
+			response->append("You have reached bar resource.");
+		}
+		else {
+			response->setStatusCode(404);
+			response->append("Nothing is here.");
+		}
+	}
+
+private:
+	int port = 8080;
+	Pool* pool;
+
+	void c_handler(int r_sock, sockaddr_in cli_addr) {
 		Request request(r_sock, &cli_addr);
 		Response response(request);
 
 		if (!request.isReady()) { return; }
 
-		char* path = request.getPath();
-		char* method = request.getMethod();
+		m_handler(&request, &response);
 
-		if (!strcmp(path, "/")) {
-			if (!strcmp(method, "GET")) {
-				response.setStatusCode(200);
-				response.append("Hello, world!");
-			}
-			else {
-				response.setStatusCode(405);
-			}
-		}
-		else if (!strcmp(path, "/foo")) {
-			if (!strcmp(method, "GET")) {
-				response.setStatusCode(200);
-				response.append("You have reached foo resource.");
-			}
-			else if (!strcmp(method, "POST")) {
-				response.setStatusCode(500);
-			}
-			else {
-				response.setStatusCode(405);
-			}
-		}
-		else if (!strcmp(path, "/bar")) {
-			response.setStatusCode(200);
-			response.append("You have reached bar resource.");
-		}
-		else {
-			response.setStatusCode(404);
-			response.append("Nothing is here.");
-		}
+		// start of info
+		auto now = std::chrono::system_clock::now().time_since_epoch().count();
+		time_t  n_now = now % 1000; now = now / 1000;
+		time_t  u_now = now % 1000; now = now / 1000;
+		time_t  m_now = now % 1000; now = now / 1000;
+		time_t  t_now = now;
+		struct tm  ts;
+		//2018-01-02 11:11:33.333 333 333NUL
+		char buf[32] = {0};
+		ts = *localtime(&t_now);
+		strftime(buf, 19+1, "%F %T", &ts);
+		sprintf(buf+19, ".%03d", m_now);
+		sprintf(buf+19+4, " %03d", u_now);
+		sprintf(buf+19+4+4, " %03d", n_now);
+		std::cout
+			<< "[" << buf << "] "
+			//<< request.getRemoteAddr() << " "
+			<< request.getMethod() << " "
+			<< request.getPath() << " "
+			<< response.getStatusCode() << " "
+			<< response.getContentLength() << std::endl;
+		// end of info
 	}
-
-private:
-	Pool* pool;
-	int port = 8080;
 };
