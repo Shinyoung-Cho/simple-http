@@ -5,8 +5,7 @@
 int main()
 {
 	Base base;
-	base.run();
-
+	base.start();
 
     return 0;
 }

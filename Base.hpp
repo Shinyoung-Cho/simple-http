@@ -9,6 +9,8 @@
 #include <functional>
 #include <chrono>
 
+#define DEBUG 0
+
 //#include <sched.h>
 class Pool {
 public:
@@ -50,6 +52,10 @@ private:
 	static std::mutex mutex;
 	static std::condition_variable cond;
 };
+std::vector<std::thread> Pool::pool;
+std::queue<std::function<void()>> Pool::queue;
+std::mutex Pool::mutex;
+std::condition_variable Pool::cond;
 ////////////////////////////////////////////////////////////////////////////////
 
 
@@ -87,22 +93,41 @@ public:
 		}
 
 		// http header parsing
-		char* p;
+		char* p = NULL;
 		char* r = header_buffer;
-		this->method = strtok_r(r, " \n", &r);
-		this->path = strtok_r(r, " \n", &r);
-		p = strtok_r(r, " \n", &r); // skip the protocol string
+		this->method = strtok_r(r, " ", &r);
+		this->path = strtok_r(r, " ", &r);
+		this->protocol = strtok_r(r, "\r\n", &r);
+		p = strtok_r(r, " \r\n", &r);
 		while (p) {
-			if (strcmp(p, "Content-Length:") == 0) {
-				this->contentLength = atoi(strtok_r(r, " \n", &r));
-			} p = strtok_r(r, " \n", &r);
+			// if-else statement can be extended.
+			if(strcmp(p, "Host:") == 0){
+				this->host = strtok_r(r, "\r\n", &r);
+			} else if (strcmp(p, "Content-Type:") == 0) {
+				this->contentType = strtok_r(r, "\r\n", &r);
+			} else if (strcmp(p, "Content-Length:") == 0) {
+				this->contentLength = atoi(strtok_r(r, "\r\n", &r));
+			} p = strtok_r(r, " \r\n", &r);
 		}
 
+		// path and query parsing
+		p = NULL;
+		r = this->path;
+		p = strtok_r(r, "?", &r);
+		if(p){
+			this->path = p;
+		}
+		this->queryString = r; // can be either the pointer to the query string or NULL.
+
+		// body read only if and if only,
 		if ((strcmp(this->method, "POST") == 0) && this->contentLength) {
 			if (readn(fd, read_buffer, this->contentLength) != this->contentLength) {
 				; // body is not fully read
 			}
 		}
+	}
+	bool isReady() {
+		return this->fd == -1 ? false : true;
 	}
 	int getFd() {
 		return this->fd;
@@ -116,8 +141,24 @@ public:
 	char* getRemoteAddr() {
 		return this->remoteAddr;
 	}
-	bool isReady() {
-		return this->fd == -1 ? false : true;
+	char* getHost(){
+		return this->host;
+	}
+	char* getProtocol(){
+		return this->protocol;
+	}
+	char* getQueryString(){return this->queryString;}
+	char* getContentType(){return this->contentType;}
+	char* getParameter(const char* key){ // currently does the linear search all the times
+		if(!this->queryString) return NULL;
+		char* p = NULL;
+		char* r = this->queryString;
+		p = strtok_r(r, "=&", &r);
+		while(p){
+			if(strcmp(p, key) == 0){
+				return strtok_r(r, "=&", &r);
+			} p = strtok_r(r, "=&", &r);
+		} return NULL;
 	}
 	std::string getBody() {
 		return std::string(this->read_buffer);
@@ -127,9 +168,13 @@ private:
 	char header_buffer[HEADER_BUFFER];  // read buffer from socket
 	char read_buffer[BODY_BUFFER];  // read buffer from socket
 
-	char* method;
-	char* path;
-	int contentLength;
+	char* method = NULL;
+	char* path = NULL;
+	char* queryString = NULL;
+	char* host = NULL;
+	char* protocol = NULL;
+	char* contentType = NULL;
+	int contentLength = 0;
 	char remoteAddr[18] = {0};
 
 	int fd = -1;
@@ -296,16 +341,16 @@ private:
 
 
 
-class ServerBase {
+class Base {
 public:
-	ServerBase() {
+	Base() {
 		pool = new Pool;
 	}
-	ServerBase(int port) {
+	Base(int port) {
 		pool = new Pool;
 		this->port = port;
 	}
-	~ServerBase() {
+	~Base() {
 		delete pool;
 	}
 
@@ -340,13 +385,15 @@ public:
 				errno = 0; // ignore
 			}
 			else {
-				pool->insert(std::bind(&ServerBase::c_handler, this, r_sock_fd, cli_addr));
+				pool->insert(std::bind(&Base::c_handler, this, r_sock_fd, cli_addr));
 			}
 		} while (1);
 	}
 
 protected:
-	virtual void m_handler(Request* request, Response* response){
+	// request handler
+	// define as virtual so that derived class can override
+	virtual void r_handler(Request* request, Response* response){
 		char* path = request->getPath();
 		char* method = request->getMethod();
 
@@ -361,6 +408,11 @@ protected:
 		}
 		else if (!strcmp(path, "/foo")) {
 			if (!strcmp(method, "GET")) {
+				
+			char* value = request->getParameter("hello");
+#if DEBUG
+			if(value) printf("value=[%s]\n", value);
+#endif
 				response->setStatusCode(200);
 				response->append("You have reached foo resource.");
 			}
@@ -384,14 +436,50 @@ protected:
 private:
 	int port = 8080;
 	Pool* pool;
+	
+	// host handler
+	void h_handler(Request* request, Response* response){
+		
+		//denied hosts
+		if(strcmp(request->getHost(), "somehost.com") == 0){
+			std::cerr<< "requested host is not allowed." <<std::endl;
+			return;
+		}else if(strcmp(request->getHost(), "otherhost.com") == 0){
+			std::cerr<< "requested host is not allowed." <<std::endl;
+			return;
+		}
+		
+		//allowed hosts
+		if(strcmp(request->getHost(), "localhost") == 0){
+			//chain request handler here 
+			;
+		}else if(strcmp(request->getHost(), "www.example.com") == 0){
+			//chain request handler here 
+			;
+		}else{
+			// defaule request handler
+			r_handler(request, response);
+		}
+		
+		
+	}
 
+	// connection handler
 	void c_handler(int r_sock, sockaddr_in cli_addr) {
 		Request request(r_sock, &cli_addr);
 		Response response(request);
 
 		if (!request.isReady()) { return; }
 
-		m_handler(&request, &response);
+#if DEBUG
+	printf("host: [%s]\n", request.getHost());
+	printf("path: [%s]\n", request.getPath());
+	printf("qstr: [%s]\n", request.getQueryString());
+	printf("mthd: [%s]\n", request.getMethod());
+	printf("prtc: [%s]\n", request.getProtocol());
+	printf("ctyp: [%s]\n", request.getContentType());
+#endif
+		h_handler(&request, &response);
 
 		// start of info
 		auto now = std::chrono::system_clock::now().time_since_epoch().count();
